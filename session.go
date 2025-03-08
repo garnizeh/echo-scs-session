@@ -1,6 +1,7 @@
 package session
 
 import (
+	"net/http"
 	"time"
 
 	"github.com/alexedwards/scs/v2"
@@ -8,12 +9,12 @@ import (
 	"github.com/labstack/echo/v4/middleware"
 )
 
-type Config struct {
+type SessionConfig struct {
 	Skipper        middleware.Skipper
 	SessionManager *scs.SessionManager
 }
 
-var DefaultSessionConfig = Config{
+var DefaultSessionConfig = SessionConfig{
 	Skipper: middleware.DefaultSkipper,
 }
 
@@ -24,7 +25,7 @@ func LoadAndSave(sessionManager *scs.SessionManager) echo.MiddlewareFunc {
 	return LoadAndSaveWithConfig(c)
 }
 
-func LoadAndSaveWithConfig(config Config) echo.MiddlewareFunc {
+func LoadAndSaveWithConfig(config SessionConfig) echo.MiddlewareFunc {
 
 	if config.Skipper == nil {
 		config.Skipper = DefaultSessionConfig.Skipper
@@ -39,9 +40,9 @@ func LoadAndSaveWithConfig(config Config) echo.MiddlewareFunc {
 			if config.Skipper(c) {
 				return next(c)
 			}
-			c.Response().Header().Add("Vary", "Cookie")
 
 			ctx := c.Request().Context()
+
 			var token string
 			cookie, err := c.Cookie(config.SessionManager.Cookie.Name)
 			if err == nil {
@@ -56,23 +57,51 @@ func LoadAndSaveWithConfig(config Config) echo.MiddlewareFunc {
 			c.SetRequest(c.Request().WithContext(ctx))
 
 			c.Response().Before(func() {
-				switch config.SessionManager.Status(ctx) {
-
-				case scs.Modified:
-					token, expiry, err := config.SessionManager.Commit(ctx)
-					if err != nil {
-						panic(err)
+				if config.SessionManager.Status(ctx) != scs.Unmodified {
+					responseCookie := &http.Cookie{
+						Name:     config.SessionManager.Cookie.Name,
+						Path:     config.SessionManager.Cookie.Path,
+						Domain:   config.SessionManager.Cookie.Domain,
+						Secure:   config.SessionManager.Cookie.Secure,
+						HttpOnly: config.SessionManager.Cookie.HttpOnly,
+						SameSite: config.SessionManager.Cookie.SameSite,
 					}
 
-					config.SessionManager.WriteSessionCookie(ctx, c.Response().Writer, token, expiry)
+					switch config.SessionManager.Status(ctx) {
+					case scs.Modified:
+						token, expiry, err := config.SessionManager.Commit(ctx)
+						if err != nil {
+							panic(err)
+						}
 
-				case scs.Destroyed:
-					config.SessionManager.WriteSessionCookie(ctx, c.Response().Writer, "", time.Time{})
-				default:
-					// session might not exist yet
+						if config.SessionManager.GetBool(ctx, "__rememberMe") {
+							responseCookie.Expires = time.Unix(expiry.Unix()+1, 0)        // Round up to the nearest second.
+							responseCookie.MaxAge = int(time.Until(expiry).Seconds() + 1) // Round up to the nearest second.
+						}
+
+						responseCookie.Value = token
+
+					case scs.Destroyed:
+						responseCookie.Expires = time.Unix(1, 0)
+						responseCookie.MaxAge = -1
+					}
+
+					c.SetCookie(responseCookie)
+					addHeaderIfMissing(c.Response(), "Cache-Control", `no-cache="Set-Cookie"`)
+					addHeaderIfMissing(c.Response(), "Vary", "Cookie")
 				}
 			})
+
 			return next(c)
 		}
 	}
+}
+
+func addHeaderIfMissing(w http.ResponseWriter, key, value string) {
+	for _, h := range w.Header()[key] {
+		if h == value {
+			return
+		}
+	}
+	w.Header().Add(key, value)
 }
